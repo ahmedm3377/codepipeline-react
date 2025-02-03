@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template to set up an S3 bucket, CloudFront distribution, and AWS CodePipeline for a React app.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: "ahmedm3377/codepipeline-react"
+    Description: "GitHub repository containing the React project"
+
+  GitHubBranch:
+    Type: String
+    Default: "main"
+    Description: "Branch of the GitHub repository to deploy"
+
+  GitHubOAuthToken:
+    Type: String
+    NoEcho: true
+    Description: "GitHub OAuth token for AWS CodePipeline"
+
+Resources:
+  ### 1. S3 Bucket for Hosting React App ###
+  ReactAppS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "react-app-${AWS::AccountId}-${AWS::Region}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReactAppS3Bucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${ReactAppS3Bucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  ### 2. CloudFront Distribution ###
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt ReactAppS3Bucket.RegionalDomainName
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  ### 3. CodeBuild Project ###
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ReactAppBuild
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubRepo}.git"
+        GitCloneDepth: 1
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref ReactAppS3Bucket
+      Artifacts:
+        Type: S3
+        Location: !Ref ReactAppS3Bucket
+        Packaging: NONE
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeBuildServiceRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ReactAppS3Bucket}"
+                  - !Sub "arn:aws:s3:::${ReactAppS3Bucket}/*"
+
+  ### 4. CodePipeline ###
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: ReactAppPipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ReactAppS3Bucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              Configuration:
+                Owner: "ahmedm3377"
+                Repo: "codepipeline-react"
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+              OutputArtifacts:
+                - Name: SourceArtifact
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: Deploy
+          Actions:
+            - Name: S3Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                BucketName: !Ref ReactAppS3Bucket
+                Extract: true
+              InputArtifacts:
+                - Name: BuildArtifact
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodePipelineServiceRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ReactAppS3Bucket}"
+                  - !Sub "arn:aws:s3:::${ReactAppS3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CodeBuildProject.Arn
+
+Outputs:
+  S3BucketName:
+    Description: Name of the created S3 bucket.
+    Value: !Ref ReactAppS3Bucket
+
+  CloudFrontDistributionID:
+    Description: The CloudFront Distribution ID.
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontURL:
+    Description: The CloudFront distribution URL.
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  PipelineName:
+    Description: Name of the created CodePipeline.
+    Value: !Ref CodePipeline
